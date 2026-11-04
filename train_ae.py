@@ -12,7 +12,7 @@ What is trained
 What is saved
     <out>.pt          checkpoint (weights + config)
     <out>_feats.npz   for every split (train / val / test) and every --ood file:
-                        <name>_feat   (N, D)  pooled multi-layer features (D = 7 * base)
+                        <name>_feat   (N, D)  pooled multi-layer features (D = 7 * base + bott = 128 by default)
                         <name>_recon  (N,)    mean reconstruction BCE per map
     These are what you score with: Mahalanobis / kNN on the features, or the recon error.
 
@@ -198,14 +198,20 @@ def main():
 
     # ---- quick OOD check (scores fitted on train only)
     fit = maha_fit(out["train_feat"])
-    m_test, r_test = maha_score(out["test_feat"], fit), out["test_recon"]
+    r_mu, r_sd = out["train_recon"].mean(), out["train_recon"].std() + 1e-8
+
+    def recon_dev(r):                      # two-sided: simpler maps reconstruct BETTER than normal, also OOD
+        return np.abs(r - r_mu) / r_sd
+
+    m_test, r_test = maha_score(out["test_feat"], fit), recon_dev(out["test_recon"])
     print("\nAUROC, in-distribution test vs OOD (0.5 = useless, 1.0 = perfect):")
-    print(f"  {'OOD set':14s} {'Mahalanobis':>12s} {'recon error':>12s}")
+    print(f"  {'OOD set':14s} {'Mahalanobis':>12s} {'recon |dev|':>12s} {'recon (high=OOD)':>17s}")
     for name in sets:
         if name in ("train", "val", "test"):
             continue
         print(f"  {name:14s} {auroc(m_test, maha_score(out[f'{name}_feat'], fit)):12.3f} "
-              f"{auroc(r_test, out[f'{name}_recon']):12.3f}")
+              f"{auroc(r_test, recon_dev(out[f'{name}_recon'])):12.3f} "
+              f"{auroc(out['test_recon'], out[f'{name}_recon']):17.3f}")
     if not a.ood:
         print("  (no --ood files given; rerun with --ood to get this table)")
 
