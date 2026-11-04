@@ -10,7 +10,8 @@ Ground-truth paths P_gt are shortest paths found by an optimal planner (BFS == D
 on the 8-neighbour grid).
 
 Input data (made by generate_maps.py):
-    * .npz with arrays  train / val / test   of shape (N,W,W), obstacle = 1, free = 0
+    * .npz with arrays  train / val / test   of shape (N,W,W,3) [R=goal, G=start, B=obstacle] as written
+      by generate_maps.py -- only the BLUE channel is used -- or plain (N,W,W) with obstacle = 1, free = 0
     * or a single .npy / .npz array (N,W,W)  -> split with --val-frac / --test-frac
     * or a folder of PNG images (black = obstacle) -> split as above
 Use --width to set the map size (maps with another size are resized with nearest neighbour).
@@ -48,7 +49,16 @@ def _resize_nearest(maps, width):
 
 
 def _binarize(maps):
-    return (np.asarray(maps) > 0.5).astype(np.uint8)       # obstacle = 1, free = 0
+    """
+    Returns the obstacle map (N,H,W) uint8 with obstacle = 1, free = 0.
+    * (N,H,W,3) RGB data from generate_maps.py -> ONLY the blue channel (index 2) is used;
+      the red (goal) / green (start) channels are ignored here (this script samples its own start/goal).
+    * (N,H,W) data -> used as is.
+    """
+    maps = np.asarray(maps)
+    if maps.ndim == 4 and maps.shape[-1] == 3:
+        maps = maps[..., 2]
+    return (maps > 0.5).astype(np.uint8)
 
 
 def _split(maps, val_frac, test_frac, seed):
@@ -62,8 +72,14 @@ def load_maps(path, width, val_frac, test_frac, seed):
     if os.path.isdir(path):
         from PIL import Image
         files = sorted(f for f in os.listdir(path) if f.lower().endswith((".png", ".jpg", ".bmp")))
-        arr = np.stack([np.asarray(Image.open(os.path.join(path, f)).convert("L")) < 128 for f in files])
-        splits = _split(_binarize(arr), val_frac, test_frac, seed)
+        imgs = [np.asarray(Image.open(os.path.join(path, f)).convert("RGB")) for f in files]
+        obst = []
+        for im in imgs:
+            if np.array_equal(im[..., 0], im[..., 2]) and np.array_equal(im[..., 1], im[..., 2]):
+                obst.append(im[..., 2] < 128)       # plain grayscale PNG: black = obstacle
+            else:
+                obst.append(im[..., 2] > 127)       # generate_maps.py PNG: blue channel = obstacle
+        splits = _split(_binarize(np.stack(obst)), val_frac, test_frac, seed)
     else:
         data = np.load(path)
         if hasattr(data, "files"):
@@ -236,7 +252,8 @@ def save_visualizations(model, dataset, device, out_dir, n):
 # ======================================================================================
 def main():
     p = argparse.ArgumentParser(description="Train Neural A* guidance encoder")
-    p.add_argument("--data", required=True, help=".npz/.npy file or PNG folder (obstacle = 1, free = 0)")
+    p.add_argument("--data", required=True,
+                   help=".npz/.npy file or PNG folder; RGB maps from generate_maps.py -> blue channel = obstacle")
     p.add_argument("--width", type=int, default=100, help="map width = height (maps are resized if different)")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=8,
