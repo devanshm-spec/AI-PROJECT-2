@@ -240,7 +240,7 @@ def save_visualizations(model, dataset, device, out_dir, n):
             r, cc = divmod(int(t[0, 0].reshape(-1).argmax()), X.shape[-1])
             ax[0].scatter([cc], [r], c=c, s=30)
         ax[1].imshow(vis); ax[1].set_title("Neural A*: explored (green), path (red)")
-        ax[2].imshow(out["phi"][0, 0].cpu().numpy(), cmap="Greens_r"); ax[2].set_title("guidance map Phi")
+        ax[2].imshow(out["phi"][0, 0].cpu().numpy(), cmap="Greens", vmin=0, vmax=1); ax[2].set_title("guidance map Phi (white = low cost, green = high)")
         for a in ax:
             a.axis("off")
         fig.savefig(os.path.join(out_dir, f"result_{k:03d}.png"), dpi=110, bbox_inches="tight")
