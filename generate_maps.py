@@ -10,7 +10,12 @@ The map is filled with many axis-aligned rectangles of varying size placed at ra
 overlap and may be clipped by the border). Start and goal are always on free cells, are connected
 to each other (8-neighbour grid) and are at least --min-dist-frac * width path steps apart.
 
-Output (default: ocean_maps.npz) holds three uint8 arrays of shape (N, W, W, 3): train, val, test.
+Output (default: ocean_maps.npz) holds, for each split in {train, val, test}:
+    <split>        uint8 (N, W, W, 3)   the RGB maps described above
+    <split>_start  int32 (N, 2)         exact start coordinates (row, col)
+    <split>_goal   int32 (N, 2)         exact goal  coordinates (row, col)
+With --marker-radius r > 0 the red/green channels hold (2r+1)x(2r+1) blobs instead of single pixels;
+the coordinate arrays are exact either way.
     * train_guidance.py reads ONLY the blue channel (maps[..., 2]) and samples its own start/goal.
     * a heuristic-learning script can use channels 0 and 1 (goal / start) as well.
 
@@ -103,12 +108,19 @@ def place_points(grid, rng, min_dist_frac, goal_corners, corner_frac, tries=10):
     return None
 
 
-def encode_rgb(grid, start, goal):
-    """Stack into (W, W, 3): R = goal, G = start, B = obstacle map."""
-    rgb = np.zeros(grid.shape + (3,), dtype=np.uint8)
+def encode_rgb(grid, start, goal, radius=0):
+    """
+    Stack into (W, W, 3): R = goal, G = start, B = obstacle map.
+    radius = 0 -> a single pixel per point. radius = r > 0 -> a (2r+1)x(2r+1) blob around the point
+    (only on free cells) -- friendlier input for a CNN; exact coordinates are saved separately.
+    """
+    H, W = grid.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
     rgb[..., 2] = grid
-    rgb[goal[0], goal[1], 0] = 1
-    rgb[start[0], start[1], 1] = 1
+    for ch, (r, c) in ((0, goal), (1, start)):
+        r0, r1, c0, c1 = max(r - radius, 0), min(r + radius + 1, H), max(c - radius, 0), min(c + radius + 1, W)
+        rgb[r0:r1, c0:c1, ch] = (grid[r0:r1, c0:c1] == 0)
+        rgb[r, c, ch] = 1                      # the exact point is always set
     return rgb
 
 
@@ -127,7 +139,7 @@ def random_rect_map(rng, width, n_rects, min_size, max_size):
 
 
 def generate_split(rng, count, args, n_min, n_max, s_min, s_max):
-    maps = []
+    maps, starts, goals = [], [], []
     rejected = 0
     while len(maps) < count:
         n_rects = int(rng.integers(n_min, n_max + 1))
@@ -143,30 +155,39 @@ def generate_split(rng, count, args, n_min, n_max, s_min, s_max):
         if pts is None:
             rejected += 1
             continue
-        maps.append(encode_rgb(grid, *pts))
-    return np.stack(maps).astype(np.uint8), rejected
+        start, goal = pts
+        maps.append(encode_rgb(grid, start, goal, args.marker_radius))
+        starts.append(start)
+        goals.append(goal)
+    return (np.stack(maps).astype(np.uint8), np.asarray(starts, dtype=np.int32),
+            np.asarray(goals, dtype=np.int32), rejected)
 
 
-def save_pngs(maps, folder):
+def save_pngs(maps, starts, goals, folder):
+    """RGB PNGs (R = goal, G = start, B = obstacles; values 0/255) + coords.csv with exact points."""
     from PIL import Image
     os.makedirs(folder, exist_ok=True)
     for i, m in enumerate(maps):
-        # RGB PNG: R = goal, G = start, B = obstacles (values 0 / 255)
         Image.fromarray((m * 255).astype(np.uint8), mode="RGB").save(os.path.join(folder, f"{i:05d}.png"))
+    with open(os.path.join(folder, "coords.csv"), "w") as f:
+        f.write("index,start_row,start_col,goal_row,goal_col\n")
+        for i, (s_, g_) in enumerate(zip(starts, goals)):
+            f.write(f"{i},{s_[0]},{s_[1]},{g_[0]},{g_[1]}\n")
 
 
-def save_preview(maps, path, cols=4, rows=4, scale=3, gap=4, marker=2):
-    """Human-friendly preview: black = obstacle, white = free, green square = start, red square = goal."""
+def save_preview(maps, starts, goals, path, cols=4, rows=4, scale=3, gap=4, marker=2):
+    """
+    Human-friendly preview ONLY (the data itself is not changed):
+    black = obstacle, white = free, green square = start, red square = goal (enlarged so they are visible).
+    """
     from PIL import Image
     n = min(len(maps), cols * rows)
     H, W = maps[0].shape[:2]
     canvas = np.full((rows * (H * scale + gap) + gap, cols * (W * scale + gap) + gap, 3), 128, np.uint8)
     for k in range(n):
-        m = maps[k]
-        tile = np.kron(((1 - m[..., 2]) * 255).astype(np.uint8), np.ones((scale, scale), np.uint8))
+        tile = np.kron(((1 - maps[k][..., 2]) * 255).astype(np.uint8), np.ones((scale, scale), np.uint8))
         tile = np.stack([tile] * 3, -1)
-        for ch, color in ((0, (255, 0, 0)), (1, (0, 200, 0))):
-            r, c = np.argwhere(m[..., ch] > 0)[0]
+        for (r, c), color in ((goals[k], (255, 0, 0)), (starts[k], (0, 200, 0))):
             tile[max(0, (r - marker) * scale):(r + marker + 1) * scale,
                  max(0, (c - marker) * scale):(c + marker + 1) * scale] = color
         r, c = divmod(k, cols)
@@ -198,6 +219,9 @@ def main():
     p.add_argument("--goal-corners", action="store_true",
                    help="draw the goal from one of the four corner regions (default: anywhere on free space)")
     p.add_argument("--corner-frac", type=float, default=0.2, help="corner region size as fraction of width")
+    p.add_argument("--marker-radius", type=int, default=0,
+                   help="0 = start/goal are single pixels in the red/green channels; r>0 = (2r+1)x(2r+1) blobs "
+                        "(exact coordinates are always saved separately)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default="ocean_maps.npz")
     p.add_argument("--png-dir", type=str, default=None,
@@ -213,21 +237,25 @@ def main():
     print(f"width={args.width}  rects/map={n_min}-{n_max}  rect side={s_min}-{s_max}")
 
     rng = np.random.default_rng(args.seed)
-    splits = {}
+    out, splits = {}, {}
     for name, count in (("train", args.num_train), ("val", args.num_val), ("test", args.num_test)):
-        maps, rej = generate_split(rng, count, args, n_min, n_max, s_min, s_max)
-        splits[name] = maps
+        maps, starts, goals, rej = generate_split(rng, count, args, n_min, n_max, s_min, s_max)
+        out[name], out[f"{name}_start"], out[f"{name}_goal"] = maps, starts, goals
+        splits[name] = (maps, starts, goals)
         print(f"{name:5s}: {len(maps)} maps (rejected {rej}), mean obstacle density {maps[..., 2].mean():.3f}")
 
-    np.savez_compressed(args.out, **splits)
-    print(f"saved {args.out}  (keys: train, val, test; shape (N, {args.width}, {args.width}, 3); R=goal, G=start, B=obstacle(1)/free(0))")
+    np.savez_compressed(args.out, **out)
+    print(f"saved {args.out}")
+    print(f"  train/val/test            : (N, {args.width}, {args.width}, 3) uint8   R=goal, G=start, B=obstacle(1)/free(0)")
+    print("  train_start/val_start/... : (N, 2) int32  (row, col)")
+    print("  train_goal/val_goal/...   : (N, 2) int32  (row, col)")
 
     if args.png_dir:
-        for name, maps in splits.items():
-            save_pngs(maps, os.path.join(args.png_dir, name))
-        print(f"PNG files written to {args.png_dir}/")
+        for name, (maps, starts, goals) in splits.items():
+            save_pngs(maps, starts, goals, os.path.join(args.png_dir, name))
+        print(f"PNG files + coords.csv written to {args.png_dir}/")
     if args.preview:
-        save_preview(splits["train"], args.preview)
+        save_preview(*splits["train"], args.preview)
         print(f"preview written to {args.preview}")
 
 
